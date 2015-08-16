@@ -1,5 +1,6 @@
 /*
-    Copyright (c) 2012-2013 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2012-2013 Martin Sustrik  All rights reserved.
+    Copyright 2015 Garrett D'Amore <garrett@damore.org>
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -55,6 +56,8 @@
 
 #define NN_SURVEYOR_SRC_DEADLINE_TIMER 1
 
+#define NN_SURVEYOR_TIMEDOUT 1
+
 struct nn_surveyor {
 
     /*  The underlying raw SP socket. */
@@ -75,6 +78,9 @@ struct nn_surveyor {
 
     /*  Protocol-specific socket options. */
     int deadline;
+
+    /*  Flag if surveyor has timed out */
+    int timedout;
 };
 
 /*  Private functions. */
@@ -127,6 +133,7 @@ static void nn_surveyor_init (struct nn_surveyor *self,
     nn_timer_init (&self->timer, NN_SURVEYOR_SRC_DEADLINE_TIMER, &self->fsm);
     nn_msg_init (&self->tosend, 0);
     self->deadline = NN_SURVEYOR_DEFAULT_DEADLINE;
+    self->timedout = 0;
 
     /*  Start the state machine. */
     nn_fsm_start (&self->fsm);
@@ -174,7 +181,7 @@ static int nn_surveyor_events (struct nn_sockbase *self)
 
     surveyor = nn_cont (self, struct nn_surveyor, xsurveyor.sockbase);
 
-    /*  Determine the actual readability/writeability of the socket. */
+    /*  Determine the actual readability/writability of the socket. */
     rc = nn_xsurveyor_events (&surveyor->xsurveyor.sockbase);
 
     /*  If there's no survey going on we'll signal IN to interrupt polling
@@ -193,12 +200,13 @@ static int nn_surveyor_send (struct nn_sockbase *self, struct nn_msg *msg)
 
     /*  Generate new survey ID. */
     ++surveyor->surveyid;
+    surveyor->surveyid |= 0x80000000;
 
     /*  Tag the survey body with survey ID. */
-    nn_assert (nn_chunkref_size (&msg->hdr) == 0);
-    nn_chunkref_term (&msg->hdr);
-    nn_chunkref_init (&msg->hdr, 4);
-    nn_putl (nn_chunkref_data (&msg->hdr), surveyor->surveyid);
+    nn_assert (nn_chunkref_size (&msg->sphdr) == 0);
+    nn_chunkref_term (&msg->sphdr);
+    nn_chunkref_init (&msg->sphdr, 4);
+    nn_putl (nn_chunkref_data (&msg->sphdr), surveyor->surveyid);
 
     /*  Store the survey, so that it can be sent later on. */
     nn_msg_term (&surveyor->tosend);
@@ -234,8 +242,13 @@ static int nn_surveyor_recv (struct nn_sockbase *self, struct nn_msg *msg)
     surveyor = nn_cont (self, struct nn_surveyor, xsurveyor.sockbase);
 
     /*  If no survey is going on return EFSM error. */
-    if (nn_slow (!nn_surveyor_inprogress (surveyor)))
-       return -EFSM;
+    if (nn_slow (!nn_surveyor_inprogress (surveyor))) {
+        if (surveyor->timedout == NN_SURVEYOR_TIMEDOUT) {
+            surveyor->timedout = 0;
+            return -ETIMEDOUT;
+        } else
+            return -EFSM;
+    }
 
     while (1) {
 
@@ -247,15 +260,15 @@ static int nn_surveyor_recv (struct nn_sockbase *self, struct nn_msg *msg)
 
         /*  Get the survey ID. Ignore any stale responses. */
         /*  TODO: This should be done asynchronously! */
-        if (nn_slow (nn_chunkref_size (&msg->hdr) != sizeof (uint32_t)))
+        if (nn_slow (nn_chunkref_size (&msg->sphdr) != sizeof (uint32_t)))
             continue;
-        surveyid = nn_getl (nn_chunkref_data (&msg->hdr));
+        surveyid = nn_getl (nn_chunkref_data (&msg->sphdr));
         if (nn_slow (surveyid != surveyor->surveyid))
             continue;
 
         /*  Discard the header and return the message to the user. */
-        nn_chunkref_term (&msg->hdr);
-        nn_chunkref_init (&msg->hdr, 0);
+        nn_chunkref_term (&msg->sphdr);
+        nn_chunkref_init (&msg->sphdr, 0);
         break;
     }
 
@@ -400,6 +413,7 @@ static void nn_surveyor_handler (struct nn_fsm *self, int src, int type,
             case NN_TIMER_TIMEOUT:
                 nn_timer_stop (&surveyor->timer);
                 surveyor->state = NN_SURVEYOR_STATE_STOPPING_TIMER;
+                surveyor->timedout = NN_SURVEYOR_TIMEDOUT;
                 return;
             default:
                 nn_fsm_bad_action (surveyor->state, src, type);

@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2012 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2012 Martin Sustrik  All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -31,7 +31,7 @@ int nn_poller_init (struct nn_poller *self)
     self->index = 0;
     self->capacity = NN_POLLER_GRANULARITY;
     self->pollset =
-        nn_alloc (sizeof (struct pollfd*) * NN_POLLER_GRANULARITY,
+        nn_alloc (sizeof (struct pollfd) * NN_POLLER_GRANULARITY,
             "pollset");
     alloc_assert (self->pollset);
     self->hndls =
@@ -58,7 +58,7 @@ void nn_poller_add (struct nn_poller *self, int fd,
     if (nn_slow (self->size >= self->capacity)) {
         self->capacity *= 2;
         self->pollset = nn_realloc (self->pollset,
-            sizeof (struct pollfd*) * self->capacity);
+            sizeof (struct pollfd) * self->capacity);
         alloc_assert (self->pollset);
         self->hndls = nn_realloc (self->hndls,
             sizeof (struct nn_hndls_item) * self->capacity);
@@ -126,12 +126,15 @@ int nn_poller_wait (struct nn_poller *self, int timeout)
         --self->size;
         if (i != self->size) { 
             self->pollset [i] = self->pollset [self->size];
+            if (self->hndls [i].next != -1)
+                self->hndls [self->hndls [i].next].prev = -1;
             self->hndls [i] = self->hndls [self->size];
-            self->hndls [i].hndl->index = i;
+            if (self->hndls [i].hndl)
+                self->hndls [i].hndl->index = i;
         }
 
         /*  The fd from the end of the pollset may have been on removed fds
-            list itself. If so, adjust the list. */
+            list itself. If so, adjust the removed list. */
         if (nn_slow (!self->hndls [i].hndl)) {
             if (self->hndls [i].prev != -1)
                self->hndls [self->hndls [i].prev].next = i;

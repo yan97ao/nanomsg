@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2012 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2012 Martin Sustrik  All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -80,6 +80,10 @@ int main ()
     struct nn_thread threads [THREAD_COUNT];
 
     /*  Stress the shutdown algorithm. */
+
+#if defined(SIGPIPE) && defined(SIG_IGN)
+    signal (SIGPIPE, SIG_IGN);
+#endif
 
     sb = test_socket (AF_SP, NN_PUB);
     test_bind (sb, SOCKET_ADDRESS);

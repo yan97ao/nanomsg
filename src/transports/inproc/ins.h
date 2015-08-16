@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2013 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2013 Martin Sustrik  All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -40,10 +40,6 @@ struct nn_ins_item {
     /*  This is the local cache of the endpoint's protocol ID. This way we can
         check the value without actually locking the object. */
     int protocol;
-
-    /*  Number of connects on the fly. The object cannot be deallocated while
-        this value is non-zero. */
-    int connects;
 };
 
 void nn_ins_item_init (struct nn_ins_item *self,
