@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2012-2013 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2012-2013 Martin Sustrik  All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -20,8 +20,9 @@
     IN THE SOFTWARE.
 */
 
-#include <sys/epoll.h>
 #include <stdint.h>
+#include <sys/types.h>
+#include <sys/epoll.h>
 
 #define NN_POLLER_HAVE_ASYNC_ADD 1
 

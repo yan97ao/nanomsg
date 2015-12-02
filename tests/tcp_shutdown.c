@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2012 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2012 Martin Sustrik  All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -57,12 +57,16 @@ static void routine2 (NN_UNUSED void *arg)
 {
     int s;
     int i;
+    int ms;
 
     s = test_socket (AF_SP, NN_PULL);
 
     for (i = 0; i < 10; ++i) {
         test_connect (s, SOCKET_ADDRESS);
     }
+
+    ms = 2000;
+    test_setsockopt (s, NN_SOL_SOCKET, NN_RCVTIMEO, &ms, sizeof (ms));
 
     for (i = 0; i < MESSAGES_PER_THREAD; ++i) {
         test_recv (s, "hello");
@@ -81,14 +85,19 @@ int main ()
 
     /*  Stress the shutdown algorithm. */
 
+#if defined(SIGPIPE) && defined(SIG_IGN)
+    signal (SIGPIPE, SIG_IGN);
+#endif
+
     sb = test_socket (AF_SP, NN_PUB);
     test_bind (sb, SOCKET_ADDRESS);
 
     for (j = 0; j != TEST_LOOPS; ++j) {
         for (i = 0; i != THREAD_COUNT; ++i)
             nn_thread_init (&threads [i], routine, NULL);
-        for (i = 0; i != THREAD_COUNT; ++i)
+        for (i = 0; i != THREAD_COUNT; ++i) {
             nn_thread_term (&threads [i]);
+	}
     }
 
     test_close (sb);
@@ -99,10 +108,13 @@ int main ()
     test_bind (sb, SOCKET_ADDRESS);
 
     for (j = 0; j != TEST_LOOPS; ++j) {
+	int ms;
         for (i = 0; i != TEST2_THREAD_COUNT; ++i)
-            nn_thread_init (&threads [i], routine2, NULL);
+            nn_thread_init (&threads [i], routine2, &threads[i]);
         nn_atomic_init(&active, TEST2_THREAD_COUNT);
 
+	ms = 2000;
+	test_setsockopt (sb, NN_SOL_SOCKET, NN_SNDTIMEO, &ms, sizeof (ms));
         while (active.n) {
             (void) nn_send (sb, "hello", 5, NN_DONTWAIT);
         }

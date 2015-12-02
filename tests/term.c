@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2012 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2012 Martin Sustrik  All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -43,7 +43,6 @@ static void worker (NN_UNUSED void *arg)
     /*  Check that all subsequent operations fail in synchronous manner. */
     rc = nn_recv (s, buf, sizeof (buf), 0);
     nn_assert (rc == -1 && nn_errno () == ETERM);
-
     test_close (s);
 }
 

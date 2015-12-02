@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2013 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2013 Martin Sustrik  All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -37,17 +37,20 @@
 #else
 #error
 #endif
-int nn_custom_device(struct nn_device_recipe *device, int s1, int s2, int flags) 
+
+int nn_custom_device(struct nn_device_recipe *device, int s1, int s2,
+    int flags) 
 {
-    return nn_device_entry(device,s1,s2,flags);
+    return nn_device_entry (device, s1, s2, flags);
 }
 
 int nn_device (int s1, int s2)
 {
-    return nn_custom_device(&nn_ordinary_device,s1,s2,0);
+    return nn_custom_device (&nn_ordinary_device, s1, s2, 0);
 }
 
-int nn_device_entry(struct nn_device_recipe *device,int s1, int s2, int flags) 
+int nn_device_entry (struct nn_device_recipe *device, int s1, int s2,
+    NN_UNUSED int flags) 
 {
     int rc;
     int op1;
@@ -166,7 +169,8 @@ int nn_device_entry(struct nn_device_recipe *device,int s1, int s2, int flags)
     /*  Two-directional device. */
     if (device->required_checks & NN_CHECK_ALLOW_BIDIRECTIONAL) {
         if (s1rcv != -1 && s1snd != -1 && s2rcv != -1 && s2snd != -1)
-            return nn_device_twoway (device,s1, s1rcv, s1snd, s2, s2rcv, s2snd);
+            return nn_device_twoway (device, s1, s1rcv, s1snd,
+                s2, s2rcv, s2snd);
     }
 
     if (device->required_checks & NN_CHECK_ALLOW_UNIDIRECTIONAL) {
@@ -183,7 +187,7 @@ int nn_device_entry(struct nn_device_recipe *device,int s1, int s2, int flags)
     nn_assert (0);
 }
 
-int nn_device_loopback (struct nn_device_recipe *device,int s)
+int nn_device_loopback (struct nn_device_recipe *device, int s)
 {
     int rc;
     int op;
@@ -208,7 +212,8 @@ int nn_device_loopback (struct nn_device_recipe *device,int s)
 
 #if defined NN_HAVE_WINDOWS
 
-int nn_device_twoway (struct nn_device_recipe *device,int s1, nn_fd s1rcv, nn_fd s1snd,
+int nn_device_twoway (struct nn_device_recipe *device,
+    int s1, nn_fd s1rcv, nn_fd s1snd,
     int s2, nn_fd s2rcv, nn_fd s2snd)
 {
     int rc;
@@ -274,7 +279,8 @@ int nn_device_twoway (struct nn_device_recipe *device,int s1, nn_fd s1rcv, nn_fd
 
 #elif defined NN_HAVE_POLL
 
-int nn_device_twoway (struct nn_device_recipe *device,int s1, nn_fd s1rcv, nn_fd s1snd,
+int nn_device_twoway (struct nn_device_recipe *device,
+    int s1, nn_fd s1rcv, nn_fd s1snd,
     int s2, nn_fd s2rcv, nn_fd s2snd)
 {
     int rc;
@@ -312,7 +318,7 @@ int nn_device_twoway (struct nn_device_recipe *device,int s1, nn_fd s1rcv, nn_fd
 
         /*  If possible, pass the message from s1 to s2. */
         if (pfd [0].events == 0 && pfd [3].events == 0) {
-            rc = nn_device_mvmsg (device,s1, s2, NN_DONTWAIT);
+            rc = nn_device_mvmsg (device, s1, s2, NN_DONTWAIT);
             if (nn_slow (rc < 0))
                 return -1;
             pfd [0].events = POLLIN;
@@ -321,7 +327,7 @@ int nn_device_twoway (struct nn_device_recipe *device,int s1, nn_fd s1rcv, nn_fd
 
         /*  If possible, pass the message from s2 to s1. */
         if (pfd [2].events == 0 && pfd [1].events == 0) {
-            rc = nn_device_mvmsg (device,s2, s1, NN_DONTWAIT);
+            rc = nn_device_mvmsg (device, s2, s1, NN_DONTWAIT);
             if (nn_slow (rc < 0))
                 return -1;
             pfd [2].events = POLLIN;
@@ -334,19 +340,21 @@ int nn_device_twoway (struct nn_device_recipe *device,int s1, nn_fd s1rcv, nn_fd
 #error
 #endif
 
-int nn_device_oneway (struct nn_device_recipe *device,int s1, NN_UNUSED nn_fd s1rcv,
-                             int s2, NN_UNUSED nn_fd s2snd)
+int nn_device_oneway (struct nn_device_recipe *device,
+    int s1, NN_UNUSED nn_fd s1rcv,
+    int s2, NN_UNUSED nn_fd s2snd)
 {
     int rc;
 
     while (1) {
-        rc = nn_device_mvmsg (device,s1, s2, 0);
+        rc = nn_device_mvmsg (device, s1, s2, 0);
         if (nn_slow (rc < 0))
             return -1;
     }
 }
 
-int nn_device_mvmsg (struct nn_device_recipe *device,int from, int to, int flags)
+int nn_device_mvmsg (struct nn_device_recipe *device,
+    int from, int to, int flags)
 {
     int rc;
     void *body;
@@ -362,14 +370,16 @@ int nn_device_mvmsg (struct nn_device_recipe *device,int from, int to, int flags
     hdr.msg_control = &control;
     hdr.msg_controllen = NN_MSG;
     rc = nn_recvmsg (from, &hdr, flags);
-    if (nn_slow (rc < 0 && nn_errno () == ETERM))
+    if (nn_slow (rc < 0 && (nn_errno () == ETERM || nn_errno () == EBADF)))
         return -1;
     errno_assert (rc >= 0);
     
-    rc = device->nn_device_rewritemsg(device,from,to,flags,&hdr,rc);
-    if (nn_slow(rc==-1)) return -1;
-    else if (rc==0) return 0;
-    nn_assert(rc==1);
+    rc = device->nn_device_rewritemsg (device, from, to, flags, &hdr, rc);
+    if (nn_slow (rc == -1))
+        return -1;
+    else if (rc == 0)
+        return 0;
+    nn_assert(rc == 1);
 
     rc = nn_sendmsg (to, &hdr, flags);
     if (nn_slow (rc < 0 && nn_errno () == ETERM))
@@ -378,7 +388,10 @@ int nn_device_mvmsg (struct nn_device_recipe *device,int from, int to, int flags
     return 0;
 }
 
-int nn_device_rewritemsg(struct nn_device_recipe *device,int from, int to, int flags, struct nn_msghdr *msghdr,int bytes) 
+int nn_device_rewritemsg (NN_UNUSED struct nn_device_recipe *device,
+    NN_UNUSED int from, NN_UNUSED int to, NN_UNUSED int flags,
+    NN_UNUSED struct nn_msghdr *msghdr, NN_UNUSED int bytes) 
 {
-    return 1; //always forward
+    return 1; /* always forward */
 }
+

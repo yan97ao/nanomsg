@@ -1,5 +1,6 @@
 /*
-    Copyright (c) 2012 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2012 Martin Sustrik  All rights reserved.
+    Copyright 2015 Garrett D'Amore <garrett@damore.org>
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -31,15 +32,17 @@
 
 #define SOCKET_ADDRESS "tcp://127.0.0.1:5555"
 
+int sc;
+
 int main ()
 {
     int rc;
     int sb;
-    int sc;
     int i;
     int opt;
     size_t sz;
     int s1, s2;
+    void * dummy_buf;
 
     /*  Try closing bound but unconnected socket. */
     sb = test_socket (AF_SP, NN_PAIR);
@@ -161,6 +164,67 @@ int main ()
     test_close (s1);
     test_close (sb);
 
+    /*  Test two sockets binding to the same address. */
+    sb = test_socket (AF_SP, NN_PAIR);
+    test_bind (sb, SOCKET_ADDRESS);
+    s1 = test_socket (AF_SP, NN_PAIR);
+    test_bind (s1, SOCKET_ADDRESS);
+    sc = test_socket (AF_SP, NN_PAIR);
+    test_connect (sc, SOCKET_ADDRESS);
+    nn_sleep (100);
+    test_send (sb, "ABC");
+    test_recv (sc, "ABC");
+    test_close (sb);
+    test_send (s1, "ABC");
+    test_recv (sc, "ABC");
+    test_close (sc);
+    test_close (s1);
+
+    /*  Test NN_RCVMAXSIZE limit */
+    sb = test_socket (AF_SP, NN_PAIR);
+    test_bind (sb, SOCKET_ADDRESS);
+    s1 = test_socket (AF_SP, NN_PAIR);
+    test_connect (s1, SOCKET_ADDRESS);
+    opt = 4;
+    rc = nn_setsockopt (sb, NN_SOL_SOCKET, NN_RCVMAXSIZE, &opt, sizeof (opt));
+    nn_assert (rc == 0);
+    nn_sleep (100);
+    test_send (s1, "ABC");
+    test_recv (sb, "ABC");
+    test_send (s1, "0123456789012345678901234567890123456789");
+    rc = nn_recv (sb, &dummy_buf, NN_MSG, NN_DONTWAIT);
+    nn_assert (rc < 0);
+    errno_assert (nn_errno () == EAGAIN);
+    test_close (sb);
+    test_close (s1);
+
+    /*  Test that NN_RCVMAXSIZE can be -1, but not lower */
+    sb = test_socket (AF_SP, NN_PAIR);
+    opt = -1;
+    rc = nn_setsockopt (sb, NN_SOL_SOCKET, NN_RCVMAXSIZE, &opt, sizeof (opt));
+    nn_assert (rc >= 0);
+    opt = -2;
+    rc = nn_setsockopt (sb, NN_SOL_SOCKET, NN_RCVMAXSIZE, &opt, sizeof (opt));
+    nn_assert (rc < 0);
+    errno_assert (nn_errno () == EINVAL);
+    test_close (sb);
+
+    /*  Test closing a socket that is waiting to bind. */
+    sb = test_socket (AF_SP, NN_PAIR);
+    test_bind (sb, SOCKET_ADDRESS);
+    nn_sleep (100);
+    s1 = test_socket (AF_SP, NN_PAIR);
+    test_bind (s1, SOCKET_ADDRESS);
+    sc = test_socket (AF_SP, NN_PAIR);
+    test_connect (sc, SOCKET_ADDRESS);
+    nn_sleep (100);
+    test_send (sb, "ABC");
+    test_recv (sc, "ABC");
+    test_close (s1);
+    test_send (sb, "ABC");
+    test_recv (sc, "ABC");
+    test_close (sb);
+    test_close (sc);
+
     return 0;
 }
-

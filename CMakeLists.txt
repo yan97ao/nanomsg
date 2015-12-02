@@ -1,5 +1,5 @@
 #
-#   Copyright (c) 2012 250bpm s.r.o.  All rights reserved.
+#   Copyright (c) 2012 Martin Sustrik  All rights reserved.
 #   Copyright (c) 2013 GoPivotal, Inc.  All rights reserved.
 #
 #   Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -60,6 +60,7 @@ macro (add_libnanomsg_test NAME)
     add_executable (${NAME} tests/${NAME}.c)
     target_link_libraries (${NAME} nanomsg)
     add_test (NAME ${NAME} COMMAND ${NAME})
+    set_tests_properties (${NAME} PROPERTIES  TIMEOUT 30)
 endmacro (add_libnanomsg_test)
 
 #  Transport tests.
@@ -67,8 +68,11 @@ add_libnanomsg_test (inproc)
 add_libnanomsg_test (inproc_shutdown)
 add_libnanomsg_test (ipc)
 add_libnanomsg_test (ipc_shutdown)
+add_libnanomsg_test (ipc_stress)
 add_libnanomsg_test (tcp)
 add_libnanomsg_test (tcp_shutdown)
+add_libnanomsg_test (ws)
+add_libnanomsg_test (tcpmux)
 
 #  Protocol tests.
 add_libnanomsg_test (pair)
@@ -79,6 +83,7 @@ add_libnanomsg_test (survey)
 add_libnanomsg_test (bus)
 
 #  Feature tests.
+add_libnanomsg_test (async_shutdown)
 add_libnanomsg_test (block)
 add_libnanomsg_test (term)
 add_libnanomsg_test (timeo)
@@ -87,6 +92,10 @@ add_libnanomsg_test (msg)
 add_libnanomsg_test (prio)
 add_libnanomsg_test (poll)
 add_libnanomsg_test (device)
+add_libnanomsg_test (device4)
+add_libnanomsg_test (device5)
+add_libnanomsg_test (device6)
+add_libnanomsg_test (device7)
 add_libnanomsg_test (emfile)
 add_libnanomsg_test (domain)
 add_libnanomsg_test (trie)
@@ -96,6 +105,8 @@ add_libnanomsg_test (symbol)
 add_libnanomsg_test (separation)
 add_libnanomsg_test (zerocopy)
 add_libnanomsg_test (shutdown)
+add_libnanomsg_test (cmsg)
+add_libnanomsg_test (bug328)
 
 #  Build the performance tests.
 
@@ -117,6 +128,7 @@ install (FILES src/nn.h DESTINATION include/nanomsg)
 install (FILES src/inproc.h DESTINATION include/nanomsg)
 install (FILES src/ipc.h DESTINATION include/nanomsg)
 install (FILES src/tcp.h DESTINATION include/nanomsg)
+install (FILES src/ws.h DESTINATION include/nanomsg)
 install (FILES src/pair.h DESTINATION include/nanomsg)
 install (FILES src/pubsub.h DESTINATION include/nanomsg)
 install (FILES src/reqrep.h DESTINATION include/nanomsg)

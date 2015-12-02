@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2012 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2012 Martin Sustrik  All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -43,7 +43,7 @@ int main ()
     nn_stopwatch_init (&stopwatch);
     rc = nn_recv (s, buf, sizeof (buf), 0);
     elapsed = nn_stopwatch_term (&stopwatch);
-    errno_assert (rc < 0 && nn_errno () == EAGAIN);
+    errno_assert (rc < 0 && nn_errno () == ETIMEDOUT);
     time_assert (elapsed, 100000);
 
     timeo = 100;
@@ -52,7 +52,7 @@ int main ()
     nn_stopwatch_init (&stopwatch);
     rc = nn_send (s, "ABC", 3, 0);
     elapsed = nn_stopwatch_term (&stopwatch);
-    errno_assert (rc < 0 && nn_errno () == EAGAIN);
+    errno_assert (rc < 0 && nn_errno () == ETIMEDOUT);
     time_assert (elapsed, 100000);
 
     test_close (s);

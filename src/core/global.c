@@ -1,6 +1,7 @@
 /*
-    Copyright (c) 2012-2014 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2012-2014 Martin Sustrik  All rights reserved.
     Copyright (c) 2013 GoPivotal, Inc.  All rights reserved.
+    Copyright 2015 Garrett D'Amore <garrett@damore.org>
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -46,6 +47,8 @@
 #include "../transports/inproc/inproc.h"
 #include "../transports/ipc/ipc.h"
 #include "../transports/tcp/tcp.h"
+#include "../transports/ws/ws.h"
+#include "../transports/tcpmux/tcpmux.h"
 
 #include "../protocols/pair/pair.h"
 #include "../protocols/pair/xpair.h"
@@ -74,7 +77,6 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdlib.h>
 #include <time.h>
 
 #if defined NN_HAVE_MINGW
@@ -98,14 +100,6 @@
     refer to individual sockets. If there's a need to more that 0x10000 sockets,
     the type should be changed to uint32_t or int. */
 CT_ASSERT (NN_MAX_SOCKETS <= 0x10000);
-
-/*  This check is performed at the beginning of each socket operation to make
-    sure that the library was initialised and the socket actually exists. */
-#define NN_BASIC_CHECKS \
-    if (nn_slow (!self.socks || !self.socks [s])) {\
-        errno = EBADF;\
-        return -1;\
-    }
 
 #define NN_CTX_FLAG_ZOMBIE 1
 
@@ -132,10 +126,12 @@ struct nn_global {
     /*  Combination of the flags listed above. */
     int flags;
 
-    /*  List of all available transports. */
+    /*  List of all available transports.  Note that this list is not
+        dynamic; i.e. it is created during global initialization and
+        is never modified. */
     struct nn_list transports;
 
-    /*  List of all available socket types. */
+    /*  List of all available socket types.  Again this list is not dynamic.*/
     struct nn_list socktypes;
 
     /*  Pool of worker threads. */
@@ -159,7 +155,7 @@ struct nn_global {
 };
 
 /*  Singleton object containing the global state of the library. */
-static struct nn_global self = {0};
+static struct nn_global self;
 
 /*  Context creation- and termination-related private functions. */
 static void nn_global_init (void);
@@ -171,7 +167,7 @@ static void nn_global_add_socktype (struct nn_socktype *socktype);
 
 /*  Private function that unifies nn_bind and nn_connect functionality.
     It returns the ID of the newly created endpoint. */
-static int nn_global_create_ep (int s, const char *addr, int bind);
+static int nn_global_create_ep (struct nn_sock *, const char *addr, int bind);
 
 /*  Private socket creator which doesn't initialize global state and
     does no locking by itself */
@@ -183,6 +179,10 @@ static void nn_global_handler (struct nn_fsm *self,
 static void nn_global_shutdown (struct nn_fsm *self,
     int src, int type, void *srcptr);
 
+/*  Socket holds. */
+static int nn_global_hold_socket(struct nn_sock **sockp, int s);
+static int nn_global_hold_socket_locked(struct nn_sock **sockp, int s);
+static void nn_global_rele_socket(struct nn_sock *);
 
 int nn_errno (void)
 {
@@ -255,6 +255,8 @@ static void nn_global_init (void)
     nn_global_add_transport (nn_inproc);
     nn_global_add_transport (nn_ipc);
     nn_global_add_transport (nn_tcp);
+    nn_global_add_transport (nn_ws);
+    nn_global_add_transport (nn_tcpmux);
 
     /*  Plug in individual socktypes. */
     nn_global_add_socktype (nn_pair_socktype);
@@ -288,7 +290,6 @@ static void nn_global_init (void)
 
     nn_ctx_init (&self.ctx, nn_global_getpool (), NULL);
     nn_timer_init (&self.stat_timer, NN_GLOBAL_SRC_STAT_TIMER, &self.fsm);
-    nn_fsm_start (&self.fsm);
 
     /*   Initializing special sockets.  */
     addr = getenv ("NN_STATISTICS_SOCKET");
@@ -296,7 +297,7 @@ static void nn_global_init (void)
         self.statistics_socket = nn_global_create_socket (AF_SP, NN_PUB);
         errno_assert (self.statistics_socket >= 0);
 
-        rc = nn_global_create_ep (self.statistics_socket, addr, 0);
+        rc = nn_global_create_ep (self.socks[self.statistics_socket], addr, 0);
         errno_assert (rc >= 0);
     } else {
         self.statistics_socket = -1;
@@ -330,6 +331,8 @@ static void nn_global_init (void)
         errno_assert (rc == 0);
         self.hostname[63] = '\0';
     }
+
+    nn_fsm_start(&self.fsm);
 }
 
 static void nn_global_term (void)
@@ -436,6 +439,51 @@ int nn_freemsg (void *msg)
     return 0;
 }
 
+struct nn_cmsghdr *nn_cmsg_nxthdr_ (const struct nn_msghdr *mhdr,
+    const struct nn_cmsghdr *cmsg)
+{
+    char *data;
+    size_t sz;
+    struct nn_cmsghdr *next;
+    size_t headsz;
+
+    /*  Early return if no message is provided. */
+    if (nn_slow (mhdr == NULL))
+        return NULL;
+
+    /*  Get the actual data. */
+    if (mhdr->msg_controllen == NN_MSG) {
+        data = *((void**) mhdr->msg_control);
+        sz = nn_chunk_size (data);
+    }
+    else {
+        data = (char*) mhdr->msg_control;
+        sz = mhdr->msg_controllen;
+    }
+
+    /*  Ancillary data allocation was not even large enough for one element. */
+    if (nn_slow (sz < NN_CMSG_SPACE (0)))
+        return NULL;
+
+    /*  If cmsg is set to NULL we are going to return first property.
+        Otherwise move to the next property. */
+    if (!cmsg)
+        next = (struct nn_cmsghdr*) data;
+    else
+        next = (struct nn_cmsghdr*)
+            (((char*) cmsg) + NN_CMSG_ALIGN_ (cmsg->cmsg_len));
+
+    /*  If there's no space for next property, treat it as the end
+        of the property list. */
+    headsz = ((char*) next) - data;
+    if (headsz + NN_CMSG_SPACE (0) > sz ||
+          headsz + NN_CMSG_ALIGN_ (next->cmsg_len) > sz)
+        return NULL;
+    
+    /*  Success. */
+    return next;
+}
+
 int nn_global_create_socket (int domain, int protocol)
 {
     int rc;
@@ -500,7 +548,7 @@ int nn_socket (int domain, int protocol)
 
     rc = nn_global_create_socket (domain, protocol);
 
-    if(rc < 0) {
+    if (rc < 0) {
         nn_global_term ();
         nn_glock_unlock ();
         errno = -rc;
@@ -515,27 +563,45 @@ int nn_socket (int domain, int protocol)
 int nn_close (int s)
 {
     int rc;
+    struct nn_sock *sock;
 
-    NN_BASIC_CHECKS;
-
-    /*  TODO: nn_sock_term can take a long time to accomplish. It should not be
-        performed under global critical section. */
     nn_glock_lock ();
-
-    /*  Deallocate the socket object. */
-    rc = nn_sock_term (self.socks [s]);
-    if (nn_slow (rc == -EINTR)) {
+    rc = nn_global_hold_socket_locked (&sock, s);
+    if (nn_slow (rc < 0)) {
         nn_glock_unlock ();
+        errno = -rc;
+        return -1;
+    }
+
+    /*  Start the shutdown process on the socket.  This will cause
+        all other socket users, as well as endpoints, to begin cleaning up.
+        This is done with the glock held to ensure that two instances
+        of nn_close can't access the same socket. */
+    nn_sock_stop (sock);
+
+    /*  We have to drop both the hold we just acquired, as well as
+        the original hold, in order for nn_sock_term to complete. */
+    nn_sock_rele (sock);
+    nn_sock_rele (sock);
+    nn_glock_unlock ();
+
+    /*  Now clean up.  The termination routine below will block until
+        all other consumers of the socket have dropped their holds, and
+        all endpoints have cleanly exited. */
+    rc = nn_sock_term (sock);
+    if (nn_slow (rc == -EINTR)) {
+        nn_global_rele_socket (sock);
         errno = EINTR;
         return -1;
     }
 
     /*  Remove the socket from the socket table, add it to unused socket
         table. */
-    nn_free (self.socks [s]);
+    nn_glock_lock ();
     self.socks [s] = NULL;
     self.unused [NN_MAX_SOCKETS - self.nsocks] = s;
     --self.nsocks;
+    nn_free (sock);
 
     /*  Destroy the global context if there's no socket remaining. */
     nn_global_term ();
@@ -549,93 +615,126 @@ int nn_setsockopt (int s, int level, int option, const void *optval,
     size_t optvallen)
 {
     int rc;
+    struct nn_sock *sock;
 
-    NN_BASIC_CHECKS;
-
-    if (nn_slow (!optval && optvallen)) {
-        errno = EFAULT;
-        return -1;
-    }
-
-    rc = nn_sock_setopt (self.socks [s], level, option, optval, optvallen);
+    rc = nn_global_hold_socket (&sock, s);
     if (nn_slow (rc < 0)) {
         errno = -rc;
         return -1;
     }
-    errnum_assert (rc == 0, -rc);
 
+    if (nn_slow (!optval && optvallen)) {
+        rc = -EFAULT;
+        goto fail;
+    }
+
+    rc = nn_sock_setopt (sock, level, option, optval, optvallen);
+    if (nn_slow (rc < 0))
+        goto fail;
+    errnum_assert (rc == 0, -rc);
+    nn_global_rele_socket (sock);
     return 0;
+
+fail:
+    nn_global_rele_socket (sock);
+    errno = -rc;
+    return -1;
 }
 
 int nn_getsockopt (int s, int level, int option, void *optval,
     size_t *optvallen)
 {
     int rc;
+    struct nn_sock *sock;
 
-    NN_BASIC_CHECKS;
-
-    if (nn_slow (!optval && optvallen)) {
-        errno = EFAULT;
-        return -1;
-    }
-
-    rc = nn_sock_getopt (self.socks [s], level, option, optval, optvallen);
+    rc = nn_global_hold_socket (&sock, s);
     if (nn_slow (rc < 0)) {
         errno = -rc;
         return -1;
     }
-    errnum_assert (rc == 0, -rc);
 
+    if (nn_slow (!optval && optvallen)) {
+        rc = -EFAULT;
+        goto fail;
+    }
+
+    rc = nn_sock_getopt (sock, level, option, optval, optvallen);
+    if (nn_slow (rc < 0))
+        goto fail;
+    errnum_assert (rc == 0, -rc);
+    nn_global_rele_socket (sock);
     return 0;
+
+fail:
+    nn_global_rele_socket (sock);
+    errno = -rc;
+    return -1;
 }
 
 int nn_bind (int s, const char *addr)
 {
     int rc;
+    struct nn_sock *sock;
 
-    NN_BASIC_CHECKS;
-
-    nn_glock_lock();
-    rc = nn_global_create_ep (s, addr, 1);
-    nn_glock_unlock();
+    rc = nn_global_hold_socket (&sock, s);
     if (rc < 0) {
         errno = -rc;
         return -1;
     }
 
+    rc = nn_global_create_ep (sock, addr, 1);
+    if (nn_slow (rc < 0)) {
+        nn_global_rele_socket (sock);
+        errno = -rc;
+        return -1;
+    }
+
+    nn_global_rele_socket (sock);
     return rc;
 }
 
 int nn_connect (int s, const char *addr)
 {
     int rc;
+    struct nn_sock *sock;
 
-    NN_BASIC_CHECKS;
-
-    nn_glock_lock();
-    rc = nn_global_create_ep (s, addr, 0);
-    nn_glock_unlock();
-    if (rc < 0) {
+    rc = nn_global_hold_socket (&sock, s);
+    if (nn_slow (rc < 0)) {
         errno = -rc;
         return -1;
     }
 
+    rc = nn_global_create_ep (sock, addr, 0);
+    if (rc < 0) {
+        nn_global_rele_socket (sock);
+        errno = -rc;
+        return -1;
+    }
+
+    nn_global_rele_socket (sock);
     return rc;
 }
 
 int nn_shutdown (int s, int how)
 {
     int rc;
+    struct nn_sock *sock;
 
-    NN_BASIC_CHECKS;
-
-    rc = nn_sock_rm_ep (self.socks [s], how);
+    rc = nn_global_hold_socket (&sock, s);
     if (nn_slow (rc < 0)) {
+        errno = -rc;
+        return -1;
+    }
+
+    rc = nn_sock_rm_ep (sock, how);
+    if (nn_slow (rc < 0)) {
+        nn_global_rele_socket (sock);
         errno = -rc;
         return -1;
     }
     nn_assert (rc == 0);
 
+    nn_global_rele_socket (sock);
     return 0;
 }
 
@@ -675,29 +774,36 @@ int nn_sendmsg (int s, const struct nn_msghdr *msghdr, int flags)
 {
     int rc;
     size_t sz;
+    size_t spsz;
     int i;
     struct nn_iovec *iov;
     struct nn_msg msg;
     void *chunk;
     int nnmsg;
+    struct nn_cmsghdr *cmsg;
+    struct nn_sock *sock;
 
-    NN_BASIC_CHECKS;
-
-    if (nn_slow (!msghdr)) {
-        errno = EINVAL;
+    rc = nn_global_hold_socket (&sock, s);
+    if (nn_slow (rc < 0)) {
+        errno = -rc;
         return -1;
     }
 
+    if (nn_slow (!msghdr)) {
+        rc = -EINVAL;
+        goto fail;
+    }
+
     if (nn_slow (msghdr->msg_iovlen < 0)) {
-        errno = EMSGSIZE;
-        return -1;
+        rc = -EMSGSIZE;
+        goto fail;
     }
 
     if (msghdr->msg_iovlen == 1 && msghdr->msg_iov [0].iov_len == NN_MSG) {
         chunk = *(void**) msghdr->msg_iov [0].iov_base;
         if (nn_slow (chunk == NULL)) {
-            errno = EFAULT;
-            return -1;
+            rc = -EFAULT;
+            goto fail;
         }
         sz = nn_chunk_size (chunk);
         nn_msg_init_chunk (&msg, chunk);
@@ -710,16 +816,16 @@ int nn_sendmsg (int s, const struct nn_msghdr *msghdr, int flags)
         for (i = 0; i != msghdr->msg_iovlen; ++i) {
             iov = &msghdr->msg_iov [i];
             if (nn_slow (iov->iov_len == NN_MSG)) {
-               errno = EINVAL;
-               return -1;
+               rc = -EINVAL;
+               goto fail;
             }
             if (nn_slow (!iov->iov_base && iov->iov_len)) {
-                errno = EFAULT;
-                return -1;
+                rc = -EFAULT;
+                goto fail;
             }
             if (nn_slow (sz + iov->iov_len < sz)) {
-                errno = EINVAL;
-                return -1;
+                rc = -EINVAL;
+                goto fail;
             }
             sz += iov->iov_len;
         }
@@ -739,20 +845,45 @@ int nn_sendmsg (int s, const struct nn_msghdr *msghdr, int flags)
 
     /*  Add ancillary data to the message. */
     if (msghdr->msg_control) {
+
+        /*  Copy all headers. */
+        /*  TODO: SP_HDR should not be copied here! */
         if (msghdr->msg_controllen == NN_MSG) {
             chunk = *((void**) msghdr->msg_control);
-            nn_chunkref_term (&msg.hdr);
-            nn_chunkref_init_chunk (&msg.hdr, chunk);
+            nn_chunkref_term (&msg.hdrs);
+            nn_chunkref_init_chunk (&msg.hdrs, chunk);
         }
         else {
+            nn_chunkref_term (&msg.hdrs);
+            nn_chunkref_init (&msg.hdrs, msghdr->msg_controllen);
+            memcpy (nn_chunkref_data (&msg.hdrs),
+                msghdr->msg_control, msghdr->msg_controllen);
+        }
 
-            /*  TODO: Copy the control data to the message. */
-            nn_assert (0);
+        /* Search for SP_HDR property. */
+        cmsg = NN_CMSG_FIRSTHDR (msghdr);
+        while (cmsg) {
+            if (cmsg->cmsg_level == PROTO_SP && cmsg->cmsg_type == SP_HDR) {
+                unsigned char *ptr = NN_CMSG_DATA (cmsg);
+                size_t clen = cmsg->cmsg_len - NN_CMSG_SPACE (0);
+                if (clen > sizeof (size_t)) {
+                    spsz = *(size_t *)(void *)ptr;
+                    if (spsz <= (clen - sizeof (size_t))) {
+                        /*  Copy body of SP_HDR property into 'sphdr'. */
+                        nn_chunkref_term (&msg.sphdr);
+                        nn_chunkref_init (&msg.sphdr, spsz);
+                         memcpy (nn_chunkref_data (&msg.sphdr),
+                             ptr + sizeof (size_t), spsz);
+                    }
+                }
+                break;
+            }
+            cmsg = NN_CMSG_NXTHDR (msghdr, cmsg);
         }
     }
 
     /*  Send it further down the stack. */
-    rc = nn_sock_send (self.socks [s], &msg, flags);
+    rc = nn_sock_send (sock, &msg, flags);
     if (nn_slow (rc < 0)) {
 
         /*  If we are dealing with user-supplied buffer, detach it from
@@ -761,15 +892,22 @@ int nn_sendmsg (int s, const struct nn_msghdr *msghdr, int flags)
             nn_chunkref_init (&msg.body, 0);
 
         nn_msg_term (&msg);
-        errno = -rc;
-        return -1;
+        goto fail;
     }
 
     /*  Adjust the statistics. */
-    nn_sock_stat_increment (self.socks [s], NN_STAT_MESSAGES_SENT, 1);
-    nn_sock_stat_increment (self.socks [s], NN_STAT_BYTES_SENT, sz);
+    nn_sock_stat_increment (sock, NN_STAT_MESSAGES_SENT, 1);
+    nn_sock_stat_increment (sock, NN_STAT_BYTES_SENT, sz);
+
+    nn_global_rele_socket (sock);
 
     return (int) sz;
+
+fail:
+    nn_global_rele_socket (sock);
+
+    errno = -rc;
+    return -1;
 }
 
 int nn_recvmsg (int s, struct nn_msghdr *msghdr, int flags)
@@ -781,24 +919,34 @@ int nn_recvmsg (int s, struct nn_msghdr *msghdr, int flags)
     int i;
     struct nn_iovec *iov;
     void *chunk;
+    size_t hdrssz;
+    void *ctrl;
+    size_t ctrlsz;
+    size_t spsz;
+    size_t sptotalsz;
+    struct nn_cmsghdr *chdr;
+    struct nn_sock *sock;
 
-    NN_BASIC_CHECKS;
-
-    if (nn_slow (!msghdr)) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    if (nn_slow (msghdr->msg_iovlen < 0)) {
-        errno = EMSGSIZE;
-        return -1;
-    }
-
-    /*  Get a message. */
-    rc = nn_sock_recv (self.socks [s], &msg, flags);
+    rc = nn_global_hold_socket (&sock, s);
     if (nn_slow (rc < 0)) {
         errno = -rc;
         return -1;
+    }
+
+    if (nn_slow (!msghdr)) {
+        rc = -EINVAL;
+        goto fail;
+    }
+
+    if (nn_slow (msghdr->msg_iovlen < 0)) {
+        rc = -EMSGSIZE;
+        goto fail;
+    }
+
+    /*  Get a message. */
+    rc = nn_sock_recv (sock, &msg, flags);
+    if (nn_slow (rc < 0)) {
+        goto fail;
     }
 
     if (msghdr->msg_iovlen == 1 && msghdr->msg_iov [0].iov_len == NN_MSG) {
@@ -815,8 +963,8 @@ int nn_recvmsg (int s, struct nn_msghdr *msghdr, int flags)
             iov = &msghdr->msg_iov [i];
             if (nn_slow (iov->iov_len == NN_MSG)) {
                 nn_msg_term (&msg);
-                errno = EINVAL;
-                return -1;
+                rc = -EINVAL;
+                goto fail;
             }
             if (iov->iov_len > sz) {
                 memcpy (iov->iov_base, data, sz);
@@ -831,21 +979,68 @@ int nn_recvmsg (int s, struct nn_msghdr *msghdr, int flags)
 
     /*  Retrieve the ancillary data from the message. */
     if (msghdr->msg_control) {
+
+        spsz = nn_chunkref_size (&msg.sphdr);
+        sptotalsz = NN_CMSG_SPACE (spsz+sizeof (size_t));
+        ctrlsz = sptotalsz + nn_chunkref_size (&msg.hdrs);
+
         if (msghdr->msg_controllen == NN_MSG) {
-            chunk = nn_chunkref_getchunk (&msg.hdr);
-            *((void**) msghdr->msg_control) = chunk;
+
+            /* Allocate the buffer. */
+            rc = nn_chunk_alloc (ctrlsz, 0, &ctrl);
+            errnum_assert (rc == 0, -rc);
+
+            /* Set output parameters. */
+            *((void**) msghdr->msg_control) = ctrl;
         }
         else {
 
-            /*  TODO: Copy the data to the supplied buffer, prefix them
-                with size. */
-            nn_assert (0);
+            /* Just use the buffer supplied by the user. */
+            ctrl = msghdr->msg_control;
+            ctrlsz = msghdr->msg_controllen;
+        }
+
+        /* If SP header alone won't fit into the buffer, return no ancillary
+           properties. */
+        if (ctrlsz >= sptotalsz) {
+            char *ptr;
+
+            /*  Fill in SP_HDR ancillary property. */
+            chdr = (struct nn_cmsghdr*) ctrl;
+            chdr->cmsg_len = sptotalsz;
+            chdr->cmsg_level = PROTO_SP;
+            chdr->cmsg_type = SP_HDR;
+            ptr = (void *)chdr;
+            ptr += sizeof (*chdr);
+            *(size_t *)(void *)ptr = spsz;
+            ptr += sizeof (size_t);
+            memcpy (ptr, nn_chunkref_data (&msg.sphdr), spsz);
+
+            /*  Fill in as many remaining properties as possible.
+                Truncate the trailing properties if necessary. */
+            hdrssz = nn_chunkref_size (&msg.hdrs);
+            if (hdrssz > ctrlsz - sptotalsz)
+                hdrssz = ctrlsz - sptotalsz;
+            memcpy (((char*) ctrl) + sptotalsz,
+                nn_chunkref_data (&msg.hdrs), hdrssz);
         }
     }
 
     nn_msg_term (&msg);
 
+    /*  Adjust the statistics. */
+    nn_sock_stat_increment (sock, NN_STAT_MESSAGES_RECEIVED, 1);
+    nn_sock_stat_increment (sock, NN_STAT_BYTES_RECEIVED, sz);
+
+    nn_global_rele_socket (sock);
+
     return (int) sz;
+
+fail:
+    nn_global_rele_socket (sock);
+
+    errno = -rc;
+    return -1;
 }
 
 static void nn_global_add_transport (struct nn_transport *transport)
@@ -854,7 +1049,6 @@ static void nn_global_add_transport (struct nn_transport *transport)
         transport->init ();
     nn_list_insert (&self.transports, &transport->item,
         nn_list_end (&self.transports));
-
 }
 
 static void nn_global_add_socktype (struct nn_socktype *socktype)
@@ -1009,17 +1203,27 @@ static void nn_global_submit_errors (int i, struct nn_sock *s,
     }
 }
 
-static void nn_global_submit_statistics () {
+static void nn_global_submit_statistics ()
+{
     int i;
+    struct nn_sock *s;
 
     /*  TODO(tailhook)  optimized it to use nsocks and unused  */
     for(i = 0; i < NN_MAX_SOCKETS; ++i) {
-        struct nn_sock *s = self.socks [i];
-        if (!s)
+
+        nn_glock_lock ();
+        s = self.socks [i];
+        if (!s) {
+            nn_glock_unlock ();
             continue;
-        if (i == self.statistics_socket)
+        }
+        if (i == self.statistics_socket) {
+            nn_glock_unlock ();
             continue;
+        }
         nn_ctx_enter (&s->ctx);
+        nn_glock_unlock ();
+
         nn_global_submit_counter (i, s,
             "established_connections", s->statistics.established_connections);
         nn_global_submit_counter (i, s,
@@ -1054,7 +1258,8 @@ static void nn_global_submit_statistics () {
     }
 }
 
-static int nn_global_create_ep (int s, const char *addr, int bind)
+static int nn_global_create_ep (struct nn_sock *sock, const char *addr,
+    int bind)
 {
     int rc;
     const char *proto;
@@ -1097,7 +1302,7 @@ static int nn_global_create_ep (int s, const char *addr, int bind)
     }
 
     /*  Ask the socket to create the endpoint. */
-    rc = nn_sock_add_ep (self.socks [s], tp, bind, addr);
+    rc = nn_sock_add_ep (sock, tp, bind, addr);
     return rc;
 }
 
@@ -1108,7 +1313,6 @@ struct nn_transport *nn_global_transport (int id)
 
     /*  Find the specified protocol. */
     tp = NULL;
-    nn_glock_lock ();
     for (it = nn_list_begin (&self.transports);
           it != nn_list_end (&self.transports);
           it = nn_list_next (&self.transports, it)) {
@@ -1117,7 +1321,6 @@ struct nn_transport *nn_global_transport (int id)
             break;
         tp = NULL;
     }
-    nn_glock_unlock ();
 
     return tp;
 }
@@ -1215,4 +1418,50 @@ static void nn_global_shutdown (struct nn_fsm *self,
 
 int nn_global_print_errors () {
     return self.print_errors;
+}
+
+/*  Get the socket structure for a socket id.  This must be called under
+    the global lock (nn_glock_lock.)  The socket itself will not be freed
+    while the hold is active. */
+int nn_global_hold_socket_locked(struct nn_sock **sockp, int s)
+{
+    struct nn_sock *sock;
+
+    if (nn_slow (self.socks == NULL)) {
+        *sockp = NULL;
+        return -ETERM;
+    }
+    if (nn_slow ((self.flags & NN_CTX_FLAG_ZOMBIE) != 0)) {
+        *sockp = NULL;
+        return -ETERM;
+    }
+
+    if (nn_slow (s < 0 || s >= NN_MAX_SOCKETS))
+        return -EBADF;
+
+    sock = self.socks[s];
+    if (nn_slow (sock == NULL))
+        return -EBADF;
+
+    if (nn_slow (nn_sock_hold (sock) != 0)) {
+        return -EBADF;
+    }
+    *sockp = sock;
+    return 0;
+}
+
+int nn_global_hold_socket(struct nn_sock **sockp, int s)
+{
+    int rc;
+    nn_glock_lock();
+    rc = nn_global_hold_socket_locked(sockp, s);
+    nn_glock_unlock();
+    return rc;
+}
+
+void nn_global_rele_socket(struct nn_sock *sock)
+{
+    nn_glock_lock();
+    nn_sock_rele(sock);
+    nn_glock_unlock();
 }

@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2012-2013 250bpm s.r.o.  All rights reserved.
+    Copyright (c) 2012-2013 Martin Sustrik  All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -24,6 +24,7 @@
 
 #include "../../utils/err.h"
 #include "../../utils/cont.h"
+#include "../../utils/attr.h"
 
 #include <string.h>
 
@@ -108,8 +109,9 @@ void nn_dns_start (struct nn_dns *self, const char *addr, size_t addrlen,
         return;
     }
 
-    /*  Check that exactly one address is returned and store it. */
-    nn_assert (reply && !reply->ai_next);
+    /*  Take just the first address and store it.  (RFC recommends that we
+        iterate through addresses until one works, but that doesn't match
+        our state model.  This is the best we can do.) */
     self->result->error = 0;
     memcpy (&self->result->addr, reply->ai_addr, reply->ai_addrlen);
     self->result->addrlen = reply->ai_addrlen;
@@ -124,7 +126,7 @@ void nn_dns_stop (struct nn_dns *self)
 }
 
 static void nn_dns_shutdown (struct nn_fsm *self, int src, int type,
-    void *srcptr)
+    NN_UNUSED void *srcptr)
 {
     struct nn_dns *dns;
 
@@ -139,7 +141,7 @@ static void nn_dns_shutdown (struct nn_fsm *self, int src, int type,
 }
 
 static void nn_dns_handler (struct nn_fsm *self, int src, int type,
-    void *srcptr)
+    NN_UNUSED void *srcptr)
 {
     struct nn_dns *dns;
 
